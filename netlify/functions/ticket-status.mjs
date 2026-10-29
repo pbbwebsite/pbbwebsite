@@ -1,0 +1,10 @@
+const json=(statusCode,body)=>({statusCode,headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff'},body:JSON.stringify(body)});
+async function db(path){const key=process.env.SUPABASE_SERVICE_ROLE_KEY;const r=await fetch(`${process.env.SUPABASE_URL.replace(/\/$/,'')}/rest/v1/${path}`,{headers:{apikey:key,authorization:`Bearer ${key}`,'content-type':'application/json'}});const text=await r.text();if(!r.ok)throw new Error('Database query failed');return text?JSON.parse(text):null}
+export async function handler(event){
+ if(event.httpMethod!=='GET')return json(405,{error:'Metode tidak didukung.'});
+ if(!process.env.SUPABASE_URL||!process.env.SUPABASE_SERVICE_ROLE_KEY)return json(503,{error:'Status tiket belum tersedia.'});
+ const orderId=String(event.queryStringParameters?.orderId||'');const access=String(event.queryStringParameters?.access||'');if(!/^PBB-[0-9]+-[A-F0-9]+$/.test(orderId)||!/^[a-f0-9]{48,}$/.test(access))return json(400,{error:'Tautan tiket tidak valid.'});
+ try{const rows=await db(`ticket_orders?order_id=eq.${encodeURIComponent(orderId)}&access_token=eq.${encodeURIComponent(access)}&select=order_id,event_slug,event_title,event_date_label,event_location,ticket_type,buyer_name,buyer_email,quantity,gross_amount,status,expires_at`);const order=rows?.[0];if(!order)return json(404,{error:'Pesanan tidak ditemukan atau tautan akses tidak valid.'});let tickets=[];if(order.status==='paid'){tickets=await db(`ticket_tickets?order_id=eq.${encodeURIComponent(orderId)}&select=ticket_code,ticket_token,status,ticket_index&order=ticket_index.asc`);}
+ return json(200,{orderId:order.order_id,eventSlug:order.event_slug,eventTitle:order.event_title,eventDateLabel:order.event_date_label,eventLocation:order.event_location,ticketType:order.ticket_type,status:order.status,buyerName:order.buyer_name,quantity:order.quantity,amount:order.gross_amount,expiresAt:order.expires_at,tickets:(tickets||[]).map(t=>({code:t.ticket_code,token:t.ticket_token,status:t.status}))});
+ }catch{return json(500,{error:'Status pesanan belum dapat dibaca.'})}
+}

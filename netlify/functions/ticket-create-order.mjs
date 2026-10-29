@@ -1,0 +1,50 @@
+import { readTicketSettings } from './_ticket-cms.mjs';
+import { randomBytes } from 'node:crypto';
+const json=(statusCode,body)=>({statusCode,headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff'},body:JSON.stringify(body)});
+const clean=(v,max)=>typeof v==='string'?v.trim().slice(0,max):'';
+const validEmail=v=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)&&v.length<=254;
+const sameOrigin=event=>{const origin=event.headers.origin;if(!origin)return true;try{return new URL(origin).host===(event.headers.host||event.headers['x-forwarded-host'])}catch{return false}};
+async function db(path,options={}){const base=process.env.SUPABASE_URL, key=process.env.SUPABASE_SERVICE_ROLE_KEY;if(!base||!key)throw new Error('Database tiket belum dikonfigurasi.');const r=await fetch(`${base.replace(/\/$/,'')}/rest/v1/${path}`,{...options,headers:{apikey:key,authorization:`Bearer ${key}`,'content-type':'application/json',prefer:options.prefer||'return=representation',...(options.headers||{})}});const body=await r.text();if(!r.ok)throw new Error(`Database menolak permintaan (HTTP ${r.status}).`);return body?JSON.parse(body):null}
+export async function handler(event){
+ if(event.httpMethod==='OPTIONS')return {statusCode:204,headers:{'access-control-allow-origin':'','access-control-allow-methods':'POST, OPTIONS','access-control-allow-headers':'content-type'}};
+ if(event.httpMethod!=='POST')return json(405,{error:'Metode tidak didukung.'});
+ if(!sameOrigin(event))return json(403,{error:'Asal permintaan tidak diizinkan.'});
+ if(process.env.TICKETING_ENABLED!=='true')return json(503,{error:'Penjualan tiket belum diaktifkan.'});
+ if(!process.env.MIDTRANS_SERVER_KEY||!process.env.SUPABASE_URL||!process.env.SUPABASE_SERVICE_ROLE_KEY)return json(503,{error:'Konfigurasi pembayaran belum lengkap.'});
+ let input;try{input=JSON.parse(event.body||'{}')}catch{return json(400,{error:'Format formulir tidak valid.'})}
+ const eventSlug=typeof input.eventSlug==='string'?input.eventSlug.trim():'';if(!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(eventSlug))return json(400,{error:'Pilih acara tiket yang valid.'});
+ let ticketConfig;try{ticketConfig=await readTicketSettings(eventSlug)}catch(error){const message=String(error?.message||'');if(/^(Harga tiket harus|Kapasitas tiket harus|Batas pembelian harus|Waktu salesStartsAt|Waktu salesEndsAt|Periode penjualan tidak valid|Nama acara tiket wajib)/.test(message))return json(422,{error:message});return json(404,{error:'Acara tiket tidak ditemukan atau belum dipublikasikan.'})}if(!ticketConfig.active)return json(503,{error:'Penjualan acara ini sedang ditutup.'});if(!ticketConfig.salesAvailable)return json(503,{error:'Penjualan acara ini belum dimulai atau sudah berakhir.'});
+ const name=clean(input.name,120),address=clean(input.address,250),phone=clean(input.phone,30),email=clean(input.email,254).toLowerCase(),quantity=Number(input.quantity);
+ if(name.length<2||address.length<5||phone.replace(/\D/g,'').length<8||!validEmail(email)||!Number.isInteger(quantity)||quantity<1||quantity>Number(ticketConfig.maxPerOrder||5))return json(400,{error:'Periksa nama, alamat, nomor HP, email, dan jumlah tiket.'});
+ const price=Number(ticketConfig.price);if(!Number.isSafeInteger(price)||price<1)return json(503,{error:'Harga tiket belum dikonfigurasi.'});
+ const amount=price*quantity;if(!Number.isSafeInteger(amount)||amount>50000000)return json(400,{error:'Total pesanan tidak valid.'});
+ const orderId=`PBB-${Date.now()}-${randomBytes(5).toString('hex').toUpperCase()}`;
+ let reserved=false, orderCreated=false, chargeAttempted=false;
+ // Expire stale pending orders before reserving capacity, so abandoned checkouts do not permanently block inventory.
+ try { const stale=await db(`ticket_orders?status=eq.pending&expires_at=lt.${encodeURIComponent(new Date().toISOString())}&select=order_id,quantity,event_slug,gateway_status&limit=100`,{method:'GET',prefer:'return=representation'}); for(const old of (stale||[])){ if(old.gateway_status==='unknown')continue; const changed=await db(`ticket_orders?order_id=eq.${encodeURIComponent(old.order_id)}&status=eq.pending`,{method:'PATCH',body:JSON.stringify({status:'expired',gateway_status:'local_expiry_cleanup',updated_at:new Date().toISOString()})}); if(changed?.length) await db('rpc/release_ticket_capacity',{method:'POST',body:JSON.stringify({p_event_slug:old.event_slug||'pbb-event',p_quantity:old.quantity})}).catch(()=>{}); } } catch { /* inventory reservation remains the final atomic guard */ }
+ try{
+   const cap=await db('rpc/configure_ticket_capacity',{method:'POST',body:JSON.stringify({p_event_slug:eventSlug,p_capacity:Number(ticketConfig.capacity)}),prefer:'return=representation'});if(cap!==true)return json(409,{error:'Kapasitas baru lebih kecil daripada tiket yang sudah teralokasi. Hubungi pengelola.'});
+   const reservation=await db('rpc/reserve_ticket_capacity',{method:'POST',body:JSON.stringify({p_event_slug:eventSlug,p_quantity:quantity}),prefer:'return=representation'});
+   if(reservation!==true)return json(409,{error:'Tiket untuk jumlah yang dipilih sudah habis. Silakan pilih jumlah lebih sedikit.'}); reserved=true;
+   const rows=await db('ticket_orders',{method:'POST',body:JSON.stringify({order_id:orderId,event_slug:eventSlug,event_title:ticketConfig.title,event_date_label:ticketConfig.dateLabel,event_location:ticketConfig.location,ticket_type:ticketConfig.ticketType,buyer_name:name,buyer_address:address,buyer_phone:phone,buyer_email:email,quantity,unit_price:price,gross_amount:amount,status:'pending',expires_at:new Date(Date.now()+15*60*1000).toISOString()}),prefer:'return=representation'});
+   if(!Array.isArray(rows)||!rows[0])throw new Error('Pesanan tidak berhasil disimpan.');orderCreated=true;
+   const auth=Buffer.from(`${process.env.MIDTRANS_SERVER_KEY}:`).toString('base64');
+   const payload={payment_type:'qris',transaction_details:{order_id:orderId,gross_amount:amount},qris:{acquirer:process.env.MIDTRANS_QRIS_ACQUIRER||'gopay'},customer_details:{first_name:name,email,phone},item_details:[{id:ticketConfig.slug,price,quantity,name:clean(`${ticketConfig.title||'Tiket PBB'} - ${ticketConfig.ticketType||'Umum'}`,50)}]};
+   const host=process.env.MIDTRANS_ENVIRONMENT==='production'?'https://api.midtrans.com':'https://api.sandbox.midtrans.com';
+   chargeAttempted=true;
+   const response=await fetch(`${host}/v2/charge`,{method:'POST',headers:{authorization:`Basic ${auth}`,'content-type':'application/json','accept':'application/json'},body:JSON.stringify(payload)});
+   const payment=await response.json().catch(()=>({}));
+   const action=(payment.actions||[]).find(a=>a.name==='generate-qr-code'||a.name==='qr-code');
+   if(!response.ok||payment.status_code!=='201'||!action?.url){
+     const uncertain=Boolean(payment.transaction_id)||['pending','settlement','capture'].includes(payment.transaction_status);
+     if(uncertain){await db(`ticket_orders?order_id=eq.${encodeURIComponent(orderId)}&status=eq.pending`,{method:'PATCH',body:JSON.stringify({gateway_status:'unknown',updated_at:new Date().toISOString()})}).catch(()=>{});reserved=false;return json(502,{error:'Gateway memberi respons yang belum pasti. Jangan membuat pembayaran kedua untuk pesanan ini; pengelola perlu memeriksa status transaksi di Midtrans.',orderId,requiresReconciliation:true});}
+     const failed=await db(`ticket_orders?order_id=eq.${encodeURIComponent(orderId)}&status=eq.pending`,{method:'PATCH',body:JSON.stringify({status:'failed',gateway_status:'charge_creation_failed',updated_at:new Date().toISOString()})}).catch(()=>null);
+     // Release only after a confirmed pending -> failed transition; a concurrent paid webhook must retain inventory.
+     if(failed?.length){await db('rpc/release_ticket_capacity',{method:'POST',body:JSON.stringify({p_event_slug:eventSlug,p_quantity:quantity})}).catch(()=>{});}
+     reserved=false;
+     return json(502,{error:'Gateway belum dapat membuat QR pembayaran. Pesanan belum dibayar; silakan coba lagi.'});
+   }
+   await db(`ticket_orders?order_id=eq.${encodeURIComponent(orderId)}`,{method:'PATCH',body:JSON.stringify({gateway_transaction_id:payment.transaction_id||null,gateway_status:payment.transaction_status||'pending',payment_qr_url:action?.url||null,updated_at:new Date().toISOString()})});
+   return json(201,{orderId,eventSlug,eventTitle:ticketConfig.title,eventDateLabel:ticketConfig.dateLabel,eventLocation:ticketConfig.location,accessToken:rows[0].access_token,amount,qrUrl:action?.url||null,expiresAt:new Date(Date.now()+15*60*1000).toISOString()});
+ }catch(error){if(reserved&&chargeAttempted&&orderCreated){await db(`ticket_orders?order_id=eq.${encodeURIComponent(orderId)}&status=eq.pending`,{method:'PATCH',body:JSON.stringify({gateway_status:'unknown',updated_at:new Date().toISOString()})}).catch(()=>{});reserved=false;return json(502,{error:'Respons pembayaran belum dapat dipastikan. Jangan mengulangi pembayaran; simpan nomor pesanan dan minta pengelola memeriksa transaksi Midtrans.',orderId,requiresReconciliation:true});}if(reserved){let release=false;try{const changed=await db(`ticket_orders?order_id=eq.${encodeURIComponent(orderId)}&status=eq.pending`,{method:'PATCH',body:JSON.stringify({status:'failed',gateway_status:'checkout_internal_error',updated_at:new Date().toISOString()})});release=Array.isArray(changed)&&changed.length>0;if(!release){const existing=await db(`ticket_orders?order_id=eq.${encodeURIComponent(orderId)}&select=status`,{method:'GET',prefer:'return=representation'});release=!Array.isArray(existing)||existing.length===0;}}catch{/* Keep reservation if order state is uncertain; stale-order cleanup can safely recover it. */}if(release)await db('rpc/release_ticket_capacity',{method:'POST',body:JSON.stringify({p_event_slug:eventSlug,p_quantity:quantity})}).catch(()=>{});}return json(500,{error:error.message==='Database tiket belum dikonfigurasi.'?error.message:'Pesanan belum dapat dibuat. Coba kembali beberapa saat lagi.'})}
+}
